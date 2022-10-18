@@ -261,7 +261,7 @@ impl SyncStore {
         data_sources: &[StoredDynamicDataSource],
         deterministic_errors: &[SubgraphError],
         manifest_idx_and_name: &[(u32, String)],
-        offchain_to_remove: &[StoredDynamicDataSource],
+        processed_data_sources: &[StoredDynamicDataSource],
     ) -> Result<(), StoreError> {
         self.retry("transact_block_operations", move || {
             let event = self.writable.transact_block_operations(
@@ -273,7 +273,7 @@ impl SyncStore {
                 data_sources,
                 deterministic_errors,
                 manifest_idx_and_name,
-                offchain_to_remove,
+                processed_data_sources,
             )?;
 
             let _section = stopwatch.start_section("send_store_event");
@@ -400,6 +400,7 @@ impl BlockTracker {
                 self.revert = self.revert.min(block_ptr.number);
                 self.block = self.block.min(block_ptr.number);
             }
+            Request::Stop => { /* do nothing */ }
         }
     }
 
@@ -430,7 +431,7 @@ enum Request {
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
         manifest_idx_and_name: Vec<(u32, String)>,
-        offchain_to_remove: Vec<StoredDynamicDataSource>,
+        processed_data_sources: Vec<StoredDynamicDataSource>,
     },
     RevertTo {
         store: Arc<SyncStore>,
@@ -438,10 +439,16 @@ enum Request {
         block_ptr: BlockPtr,
         firehose_cursor: FirehoseCursor,
     },
+    Stop,
+}
+
+enum ExecResult {
+    Continue,
+    Stop,
 }
 
 impl Request {
-    fn execute(&self) -> Result<(), StoreError> {
+    fn execute(&self) -> Result<ExecResult, StoreError> {
         match self {
             Request::Write {
                 store,
@@ -452,22 +459,27 @@ impl Request {
                 data_sources,
                 deterministic_errors,
                 manifest_idx_and_name,
-                offchain_to_remove,
-            } => store.transact_block_operations(
-                block_ptr_to,
-                firehose_cursor,
-                mods,
-                stopwatch,
-                data_sources,
-                deterministic_errors,
-                manifest_idx_and_name,
-                offchain_to_remove,
-            ),
+                processed_data_sources,
+            } => store
+                .transact_block_operations(
+                    block_ptr_to,
+                    firehose_cursor,
+                    mods,
+                    stopwatch,
+                    data_sources,
+                    deterministic_errors,
+                    manifest_idx_and_name,
+                    processed_data_sources,
+                )
+                .map(|()| ExecResult::Continue),
             Request::RevertTo {
                 store,
                 block_ptr,
                 firehose_cursor,
-            } => store.revert_block_operations(block_ptr.clone(), firehose_cursor),
+            } => store
+                .revert_block_operations(block_ptr.clone(), firehose_cursor)
+                .map(|()| ExecResult::Continue),
+            Request::Stop => return Ok(ExecResult::Stop),
         }
     }
 }
@@ -556,11 +568,18 @@ impl Queue {
                 };
 
                 let _section = queue.stopwatch.start_section("queue_pop");
+                use ExecResult::*;
                 match res {
-                    Ok(Ok(())) => {
+                    Ok(Ok(Continue)) => {
                         // The request has been handled. It's now safe to remove it
                         // from the queue
                         queue.queue.pop().await;
+                    }
+                    Ok(Ok(Stop)) => {
+                        // Graceful shutdown. We also handled the request
+                        // successfully
+                        queue.queue.pop().await;
+                        return;
                     }
                     Ok(Err(e)) => {
                         error!(logger, "Subgraph writer failed"; "error" => e.to_string());
@@ -614,6 +633,10 @@ impl Queue {
     async fn flush(&self) -> Result<(), StoreError> {
         self.queue.wait_empty().await;
         self.check_err()
+    }
+
+    async fn stop(&self) -> Result<(), StoreError> {
+        self.push(Request::Stop).await
     }
 
     fn check_err(&self) -> Result<(), StoreError> {
@@ -670,7 +693,7 @@ impl Queue {
                         None
                     }
                 }
-                Request::RevertTo { .. } => None,
+                Request::RevertTo { .. } | Request::Stop => None,
             }
         });
 
@@ -725,7 +748,7 @@ impl Queue {
                             }
                         }
                     }
-                    Request::RevertTo { .. } => { /* nothing to do */ }
+                    Request::RevertTo { .. } | Request::Stop => { /* nothing to do */ }
                 }
                 map
             },
@@ -768,18 +791,18 @@ impl Queue {
                 Request::Write {
                     block_ptr,
                     data_sources,
-                    offchain_to_remove,
+                    processed_data_sources,
                     ..
                 } => {
                     if tracker.visible(block_ptr) {
                         dds.extend(data_sources.clone());
                         dds = dds
                             .into_iter()
-                            .filter(|dds| !offchain_to_remove.contains(dds))
+                            .filter(|dds| !processed_data_sources.contains(dds))
                             .collect();
                     }
                 }
-                Request::RevertTo { .. } => { /* nothing to do */ }
+                Request::RevertTo { .. } | Request::Stop => { /* nothing to do */ }
             }
             dds
         });
@@ -833,7 +856,7 @@ impl Writer {
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
         manifest_idx_and_name: Vec<(u32, String)>,
-        offchain_to_remove: Vec<StoredDynamicDataSource>,
+        processed_data_sources: Vec<StoredDynamicDataSource>,
     ) -> Result<(), StoreError> {
         match self {
             Writer::Sync(store) => store.transact_block_operations(
@@ -844,7 +867,7 @@ impl Writer {
                 &data_sources,
                 &deterministic_errors,
                 &manifest_idx_and_name,
-                &offchain_to_remove,
+                &processed_data_sources,
             ),
             Writer::Async(queue) => {
                 let req = Request::Write {
@@ -856,7 +879,7 @@ impl Writer {
                     data_sources,
                     deterministic_errors,
                     manifest_idx_and_name,
-                    offchain_to_remove,
+                    processed_data_sources,
                 };
                 queue.push(req).await
             }
@@ -925,6 +948,13 @@ impl Writer {
             Writer::Async(queue) => queue.poisoned(),
         }
     }
+
+    async fn stop(&self) -> Result<(), StoreError> {
+        match self {
+            Writer::Sync(_) => Ok(()),
+            Writer::Async(queue) => queue.stop().await,
+        }
+    }
 }
 
 pub struct WritableStore {
@@ -961,6 +991,10 @@ impl WritableStore {
 
     pub(crate) fn poisoned(&self) -> bool {
         self.writer.poisoned()
+    }
+
+    pub(crate) async fn stop(&self) -> Result<(), StoreError> {
+        self.writer.stop().await
     }
 }
 
@@ -1060,7 +1094,7 @@ impl WritableStoreTrait for WritableStore {
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
         manifest_idx_and_name: Vec<(u32, String)>,
-        offchain_to_remove: Vec<StoredDynamicDataSource>,
+        processed_data_sources: Vec<StoredDynamicDataSource>,
     ) -> Result<(), StoreError> {
         self.writer
             .write(
@@ -1071,7 +1105,7 @@ impl WritableStoreTrait for WritableStore {
                 data_sources,
                 deterministic_errors,
                 manifest_idx_and_name,
-                offchain_to_remove,
+                processed_data_sources,
             )
             .await?;
 
